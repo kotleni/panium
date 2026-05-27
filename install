@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+cargo build --release
+sudo install -Dm755 target/release/panium /usr/local/bin/panium
