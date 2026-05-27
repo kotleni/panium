@@ -6,12 +6,13 @@ use std::{
     mem,
     os::fd::AsFd,
     ptr,
+    time::{Duration, Instant},
 };
 
 use sdl2::{
     event::Event,
     keyboard::Keycode,
-    mouse::MouseButton,
+    mouse::{MouseButton, MouseUtil},
     video::{GLContext, GLProfile, Window},
 };
 use smithay_client_toolkit::{
@@ -38,6 +39,9 @@ const MAX_ZOOM_FACTOR: f32 = 24.0;
 const KEY_ZOOM_STEP: f32 = 1.18;
 const WHEEL_ZOOM_STEP: f32 = 1.14;
 const ARROW_PAN_STEP: f32 = 72.0;
+const SPOTLIGHT_RADIUS: f32 = 70.0;
+const SPOTLIGHT_TINT: f32 = 0.42;
+const START_FADE_DURATION: Duration = Duration::from_millis(180);
 
 struct Screenshot {
     width: u32,
@@ -375,6 +379,7 @@ struct Viewer {
     window: Window,
     _context: GLContext,
     event_pump: sdl2::EventPump,
+    mouse: MouseUtil,
     image_width: f32,
     image_height: f32,
     zoom: f32,
@@ -383,6 +388,8 @@ struct Viewer {
     max_zoom: f32,
     cursor: [f32; 2],
     dragging: bool,
+    spotlight: bool,
+    started_at: Instant,
 }
 
 impl Viewer {
@@ -410,6 +417,7 @@ impl Viewer {
         gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
 
         let gl = GlResources::new(&screenshot)?;
+        let mouse = sdl.mouse();
         let event_pump = sdl.event_pump()?;
         let (width, height) = window.drawable_size();
         let fit_zoom = fit_zoom(
@@ -425,6 +433,7 @@ impl Viewer {
             window,
             _context: context,
             event_pump,
+            mouse,
             image_width: screenshot.width as f32,
             image_height: screenshot.height as f32,
             zoom,
@@ -433,6 +442,8 @@ impl Viewer {
             max_zoom: MAX_ZOOM_FACTOR,
             cursor: [width as f32 * 0.5, height as f32 * 0.5],
             dragging: false,
+            spotlight: false,
+            started_at: Instant::now(),
         })
     }
 
@@ -453,6 +464,11 @@ impl Viewer {
                         keycode: Some(Keycode::S),
                         ..
                     } => self.zoom_at_cursor(1.0 / KEY_ZOOM_STEP),
+                    Event::KeyDown {
+                        keycode: Some(Keycode::F),
+                        repeat: false,
+                        ..
+                    } => self.set_spotlight(!self.spotlight),
                     Event::KeyDown {
                         keycode: Some(Keycode::Left),
                         ..
@@ -524,6 +540,11 @@ impl Viewer {
         self.clamp_pan();
     }
 
+    fn set_spotlight(&mut self, enabled: bool) {
+        self.spotlight = enabled;
+        self.mouse.show_cursor(!enabled);
+    }
+
     fn clamp_pan(&mut self) {
         let (view_width, view_height) = self.drawable_size();
         let max_x = (self.image_width * self.zoom + view_width) * 0.5;
@@ -547,11 +568,30 @@ impl Viewer {
         let right = left + draw_width;
         let bottom = top + draw_height;
 
-        self.gl
-            .draw(view_width, view_height, [left, top, right, bottom]);
+        self.gl.draw(
+            view_width,
+            view_height,
+            [left, top, right, bottom],
+            self.cursor,
+            self.spotlight,
+            self.fade_alpha(),
+        );
         self.window.gl_swap_window();
 
         Ok(())
+    }
+
+    fn fade_alpha(&self) -> f32 {
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        let duration = START_FADE_DURATION.as_secs_f32();
+
+        (elapsed / duration).clamp(0.0, 1.0)
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        self.mouse.show_cursor(true);
     }
 }
 
@@ -572,6 +612,11 @@ struct GlResources {
     vbo: u32,
     texture: u32,
     viewport_uniform: i32,
+    spotlight_center_uniform: i32,
+    spotlight_radius_uniform: i32,
+    spotlight_tint_uniform: i32,
+    spotlight_enabled_uniform: i32,
+    fade_alpha_uniform: i32,
 }
 
 impl GlResources {
@@ -628,6 +673,16 @@ impl GlResources {
 
         let viewport_uniform =
             unsafe { gl::GetUniformLocation(program, CString::new("viewport")?.as_ptr()) };
+        let spotlight_center_uniform =
+            unsafe { gl::GetUniformLocation(program, CString::new("spotlight_center")?.as_ptr()) };
+        let spotlight_radius_uniform =
+            unsafe { gl::GetUniformLocation(program, CString::new("spotlight_radius")?.as_ptr()) };
+        let spotlight_tint_uniform =
+            unsafe { gl::GetUniformLocation(program, CString::new("spotlight_tint")?.as_ptr()) };
+        let spotlight_enabled_uniform =
+            unsafe { gl::GetUniformLocation(program, CString::new("spotlight_enabled")?.as_ptr()) };
+        let fade_alpha_uniform =
+            unsafe { gl::GetUniformLocation(program, CString::new("fade_alpha")?.as_ptr()) };
 
         Ok(Self {
             program,
@@ -635,10 +690,23 @@ impl GlResources {
             vbo,
             texture,
             viewport_uniform,
+            spotlight_center_uniform,
+            spotlight_radius_uniform,
+            spotlight_tint_uniform,
+            spotlight_enabled_uniform,
+            fade_alpha_uniform,
         })
     }
 
-    fn draw(&self, view_width: f32, view_height: f32, rect: [f32; 4]) {
+    fn draw(
+        &self,
+        view_width: f32,
+        view_height: f32,
+        rect: [f32; 4],
+        cursor: [f32; 2],
+        spotlight: bool,
+        fade_alpha: f32,
+    ) {
         let [left, top, right, bottom] = rect;
         let vertices: [f32; 24] = [
             left, top, 0.0, 0.0, right, top, 1.0, 0.0, right, bottom, 1.0, 1.0, left, top, 0.0,
@@ -651,6 +719,15 @@ impl GlResources {
             gl::Clear(gl::COLOR_BUFFER_BIT);
             gl::UseProgram(self.program);
             gl::Uniform2f(self.viewport_uniform, view_width, view_height);
+            gl::Uniform2f(
+                self.spotlight_center_uniform,
+                cursor[0],
+                view_height - cursor[1],
+            );
+            gl::Uniform1f(self.spotlight_radius_uniform, SPOTLIGHT_RADIUS);
+            gl::Uniform1f(self.spotlight_tint_uniform, SPOTLIGHT_TINT);
+            gl::Uniform1i(self.spotlight_enabled_uniform, i32::from(spotlight));
+            gl::Uniform1f(self.fade_alpha_uniform, fade_alpha);
             gl::ActiveTexture(gl::TEXTURE0);
             gl::BindTexture(gl::TEXTURE_2D, self.texture);
             gl::BindVertexArray(self.vao);
@@ -792,10 +869,24 @@ const FRAGMENT_SHADER: &str = r#"#version 330 core
 in vec2 uv;
 
 uniform sampler2D image_texture;
+uniform vec2 spotlight_center;
+uniform float spotlight_radius;
+uniform float spotlight_tint;
+uniform int spotlight_enabled;
+uniform float fade_alpha;
 out vec4 color;
 
 void main() {
-    color = texture(image_texture, uv);
+    vec4 pixel = texture(image_texture, uv);
+
+    if (spotlight_enabled == 1) {
+        float distance_from_center = distance(gl_FragCoord.xy, spotlight_center);
+        if (distance_from_center > spotlight_radius) {
+            pixel.rgb *= spotlight_tint;
+        }
+    }
+
+    color = vec4(pixel.rgb * fade_alpha, pixel.a * fade_alpha);
 }
 "#;
 
