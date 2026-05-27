@@ -1,0 +1,15 @@
+[package]
+name = "panium"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+image = "0.25"
+home = "0.5"
+tempfile = "3.10"
+sdl2 = "0.38"
+gl = "0.14"
