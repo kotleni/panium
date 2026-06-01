@@ -32,7 +32,11 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
 };
 
+use crate::shaders::{GL33_FRAGMENT_SHADER, GL33_VERTEX_SHADER};
+
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+mod shaders;
 
 const MIN_ZOOM_FACTOR: f32 = 0.15;
 const MAX_ZOOM_FACTOR: f32 = 24.0;
@@ -755,8 +759,8 @@ impl Drop for GlResources {
 }
 
 fn create_program() -> Result<u32> {
-    let vertex_shader = compile_shader(gl::VERTEX_SHADER, VERTEX_SHADER)?;
-    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, FRAGMENT_SHADER)?;
+    let vertex_shader = compile_shader(gl::VERTEX_SHADER, GL33_VERTEX_SHADER)?;
+    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, GL33_FRAGMENT_SHADER)?;
     let program = unsafe { gl::CreateProgram() };
 
     unsafe {
@@ -847,48 +851,6 @@ fn c_log_to_string(buffer: &[u8]) -> String {
         .map(|message| message.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
-
-const VERTEX_SHADER: &str = r#"#version 330 core
-layout (location = 0) in vec2 position;
-layout (location = 1) in vec2 tex_coord;
-
-uniform vec2 viewport;
-out vec2 uv;
-
-void main() {
-    vec2 ndc = vec2(
-        (position.x / viewport.x) * 2.0 - 1.0,
-        1.0 - (position.y / viewport.y) * 2.0
-    );
-    gl_Position = vec4(ndc, 0.0, 1.0);
-    uv = tex_coord;
-}
-"#;
-
-const FRAGMENT_SHADER: &str = r#"#version 330 core
-in vec2 uv;
-
-uniform sampler2D image_texture;
-uniform vec2 spotlight_center;
-uniform float spotlight_radius;
-uniform float spotlight_tint;
-uniform int spotlight_enabled;
-uniform float fade_alpha;
-out vec4 color;
-
-void main() {
-    vec4 pixel = texture(image_texture, uv);
-
-    if (spotlight_enabled == 1) {
-        float distance_from_center = distance(gl_FragCoord.xy, spotlight_center);
-        if (distance_from_center > spotlight_radius) {
-            pixel.rgb *= spotlight_tint;
-        }
-    }
-
-    color = vec4(pixel.rgb * fade_alpha, pixel.a * fade_alpha);
-}
-"#;
 
 delegate_registry!(CaptureState);
 delegate_output!(CaptureState);
