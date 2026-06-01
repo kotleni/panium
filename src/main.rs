@@ -1,11 +1,9 @@
 use std::{
+    env,
     error::Error,
     ffi::{CStr, CString},
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    mem,
-    os::fd::AsFd,
-    ptr,
+    mem, ptr,
+    str::FromStr,
     time::{Duration, Instant},
 };
 
@@ -15,28 +13,19 @@ use sdl2::{
     mouse::{MouseButton, MouseUtil},
     video::{GLContext, GLProfile, Window},
 };
-use smithay_client_toolkit::{
-    delegate_output, delegate_registry,
-    output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-};
-use tempfile::tempfile;
-use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop,
-    globals::registry_queue_init,
-    protocol::{wl_buffer, wl_output, wl_shm, wl_shm_pool},
-};
-use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
-    zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
-};
 
-use crate::shaders::{GL33_FRAGMENT_SHADER, GL33_VERTEX_SHADER};
+use crate::{
+    shaders::{
+        GL20_FRAGMENT_SHADER, GL20_VERTEX_SHADER, GL33_FRAGMENT_SHADER, GL33_VERTEX_SHADER,
+        GLES2_FRAGMENT_SHADER, GLES2_VERTEX_SHADER,
+    },
+    wayland_capture::WaylandCapturer,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 mod shaders;
+mod wayland_capture;
 
 const MIN_ZOOM_FACTOR: f32 = 0.15;
 const MAX_ZOOM_FACTOR: f32 = 24.0;
@@ -53,178 +42,89 @@ struct Screenshot {
     rgba: Vec<u8>,
 }
 
-struct CaptureState {
-    registry_state: RegistryState,
-    output_state: OutputState,
-    shm: wl_shm::WlShm,
-    capture: Capture,
-    done: bool,
-    error: Option<String>,
+trait ScreenCapturer {
+    fn capture(&self) -> Result<Screenshot>;
 }
 
-struct Capture {
-    frame: ZwlrScreencopyFrameV1,
-    file: Option<File>,
-    buffer: Option<wl_buffer::WlBuffer>,
-    pool: Option<wl_shm_pool::WlShmPool>,
-    width: u32,
-    height: u32,
-    stride: u32,
-    format: wl_shm::Format,
-    y_inverted: bool,
-    screenshot: Option<Screenshot>,
+struct Config {
+    backend: RenderBackend,
 }
 
-impl Capture {
-    fn new(frame: ZwlrScreencopyFrameV1) -> Self {
-        Self {
-            frame,
-            file: None,
-            buffer: None,
-            pool: None,
-            width: 0,
-            height: 0,
-            stride: 0,
-            format: wl_shm::Format::Xrgb8888,
-            y_inverted: false,
-            screenshot: None,
-        }
-    }
-}
+impl Config {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut backend = RenderBackend::default();
+        let mut args = args.into_iter();
 
-impl CaptureState {
-    fn prepare_buffer(
-        &mut self,
-        frame: &ZwlrScreencopyFrameV1,
-        qh: &QueueHandle<Self>,
-        format: wl_shm::Format,
-        width: u32,
-        height: u32,
-        stride: u32,
-    ) -> Result<()> {
-        if self.capture.frame.id() != frame.id() {
-            return Err("received buffer event for an unknown frame".into());
+        while let Some(arg) = args.next() {
+            if arg == "--help" || arg == "-h" {
+                return Err("usage: panium [--backend <gles2|gl33|gl20>]".into());
+            }
+
+            if arg == "--backend" {
+                let value = args
+                    .next()
+                    .ok_or("--backend requires one of: gles2, gl33, gl20")?;
+                backend = value.parse()?;
+                continue;
+            }
+
+            return Err(format!("unknown argument: {arg}").into());
         }
 
-        let size = stride
-            .checked_mul(height)
-            .ok_or("screenshot buffer size overflowed")?;
-        let file = tempfile()?;
-        file.set_len(size as u64)?;
-
-        let pool = self.shm.create_pool(file.as_fd(), size as i32, qh, ());
-        let buffer = pool.create_buffer(
-            0,
-            width as i32,
-            height as i32,
-            stride as i32,
-            format,
-            qh,
-            (),
-        );
-
-        frame.copy(&buffer);
-
-        self.capture.file = Some(file);
-        self.capture.pool = Some(pool);
-        self.capture.buffer = Some(buffer);
-        self.capture.width = width;
-        self.capture.height = height;
-        self.capture.stride = stride;
-        self.capture.format = format;
-
-        Ok(())
+        Ok(Self { backend })
     }
+}
 
-    fn finish_frame(&mut self, frame: &ZwlrScreencopyFrameV1) -> Result<()> {
-        if self.capture.frame.id() != frame.id() {
-            return Err("received ready event for an unknown frame".into());
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RenderBackend {
+    Gles2,
+    #[default]
+    Gl33,
+    Gl20,
+}
+
+impl RenderBackend {
+    fn configure_gl(self, gl_attr: &sdl2::video::gl_attr::GLAttr<'_>) {
+        match self {
+            Self::Gles2 => {
+                gl_attr.set_context_profile(GLProfile::GLES);
+                gl_attr.set_context_version(2, 0);
+            }
+            Self::Gl33 => {
+                gl_attr.set_context_profile(GLProfile::Core);
+                gl_attr.set_context_version(3, 3);
+            }
+            Self::Gl20 => {
+                gl_attr.set_context_profile(GLProfile::Compatibility);
+                gl_attr.set_context_version(2, 0);
+            }
         }
-
-        self.capture.screenshot = Some(read_screenshot(&mut self.capture)?);
-        self.done = true;
-        frame.destroy();
-
-        Ok(())
     }
 
-    fn fail(&mut self, error: impl Into<String>) {
-        self.error = Some(error.into());
-        self.done = true;
-    }
-}
-
-impl ProvidesRegistryState for CaptureState {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
+    fn shaders(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Gles2 => (GLES2_VERTEX_SHADER, GLES2_FRAGMENT_SHADER),
+            Self::Gl33 => (GL33_VERTEX_SHADER, GL33_FRAGMENT_SHADER),
+            Self::Gl20 => (GL20_VERTEX_SHADER, GL20_FRAGMENT_SHADER),
+        }
     }
 
-    registry_handlers!(OutputState);
-}
-
-impl OutputHandler for CaptureState {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-}
-
-impl Dispatch<ZwlrScreencopyManagerV1, ()> for CaptureState {
-    fn event(
-        _: &mut Self,
-        _: &ZwlrScreencopyManagerV1,
-        _: zwlr_screencopy_manager_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+    fn uses_vertex_arrays(self) -> bool {
+        self == Self::Gl33
     }
 }
 
-impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
-    fn event(
-        state: &mut Self,
-        frame: &ZwlrScreencopyFrameV1,
-        event: zwlr_screencopy_frame_v1::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwlr_screencopy_frame_v1::Event::Buffer {
-                format: WEnum::Value(format),
-                width,
-                height,
-                stride,
-            } => {
-                if let Err(error) = state.prepare_buffer(frame, qh, format, width, height, stride) {
-                    state.fail(error.to_string());
-                }
+impl FromStr for RenderBackend {
+    type Err = Box<dyn Error>;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "gles2" => Ok(Self::Gles2),
+            "gl33" => Ok(Self::Gl33),
+            "gl20" => Ok(Self::Gl20),
+            other => {
+                Err(format!("unsupported backend '{other}', expected gles2, gl33, or gl20").into())
             }
-            zwlr_screencopy_frame_v1::Event::Buffer {
-                format: WEnum::Unknown(format),
-                ..
-            } => state.fail(format!("unsupported wl_shm format advertised: {format}")),
-            zwlr_screencopy_frame_v1::Event::Flags {
-                flags: WEnum::Value(flags),
-            } => {
-                state.capture.y_inverted = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
-            }
-            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
-                if let Err(error) = state.finish_frame(frame) {
-                    state.fail(error.to_string());
-                }
-            }
-            zwlr_screencopy_frame_v1::Event::Failed => {
-                frame.destroy();
-                state.fail("screenshot failed by compositor");
-            }
-            _ => {}
         }
     }
 }
@@ -237,145 +137,11 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let screenshot = capture_screenshot()?;
-    show_zoom_window(screenshot)
-}
+    let config = Config::parse(env::args().skip(1))?;
+    println!("Backend selected: {:?}", config.backend);
 
-fn capture_screenshot() -> Result<Screenshot> {
-    let conn = Connection::connect_to_env()?;
-    let (globals, mut event_queue) = registry_queue_init(&conn)?;
-    let qh = event_queue.handle();
-
-    let shm = globals.bind::<wl_shm::WlShm, _, _>(&qh, 1..=1, ())?;
-    let manager = globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=1, ())?;
-
-    let output_state = OutputState::new(&globals, &qh);
-    let output = output_state
-        .outputs()
-        .next()
-        .ok_or("no Wayland outputs found")?;
-    let frame = manager.capture_output(0, &output, &qh, ());
-
-    let mut state = CaptureState {
-        registry_state: RegistryState::new(&globals),
-        output_state,
-        shm,
-        capture: Capture::new(frame),
-        done: false,
-        error: None,
-    };
-
-    while !state.done {
-        event_queue.blocking_dispatch(&mut state)?;
-    }
-
-    if let Some(error) = state.error {
-        Err(error.into())
-    } else {
-        state
-            .capture
-            .screenshot
-            .ok_or_else(|| "compositor finished without screenshot data".into())
-    }
-}
-
-fn read_screenshot(capture: &mut Capture) -> Result<Screenshot> {
-    let file = capture
-        .file
-        .as_mut()
-        .ok_or("compositor signaled ready before a buffer was created")?;
-    let size = capture
-        .stride
-        .checked_mul(capture.height)
-        .ok_or("screenshot buffer size overflowed")? as usize;
-
-    let mut pixels = vec![0; size];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut pixels)?;
-
-    Ok(Screenshot {
-        width: capture.width,
-        height: capture.height,
-        rgba: convert_to_rgba(
-            &pixels,
-            capture.width,
-            capture.height,
-            capture.stride,
-            capture.format,
-            capture.y_inverted,
-        )?,
-    })
-}
-
-fn convert_to_rgba(
-    pixels: &[u8],
-    width: u32,
-    height: u32,
-    stride: u32,
-    format: wl_shm::Format,
-    y_inverted: bool,
-) -> Result<Vec<u8>> {
-    let mut rgba = vec![0; (width * height * 4) as usize];
-
-    for y in 0..height {
-        let source_y = if y_inverted { height - 1 - y } else { y };
-        for x in 0..width {
-            let source = (source_y * stride + x * 4) as usize;
-            let target = ((y * width + x) * 4) as usize;
-
-            let [r, g, b, a] = match format {
-                wl_shm::Format::Argb8888 => [
-                    pixels[source + 2],
-                    pixels[source + 1],
-                    pixels[source],
-                    pixels[source + 3],
-                ],
-                wl_shm::Format::Xrgb8888 => {
-                    [pixels[source + 2], pixels[source + 1], pixels[source], 255]
-                }
-                wl_shm::Format::Abgr8888 => [
-                    pixels[source],
-                    pixels[source + 1],
-                    pixels[source + 2],
-                    pixels[source + 3],
-                ],
-                wl_shm::Format::Xbgr8888 => {
-                    [pixels[source], pixels[source + 1], pixels[source + 2], 255]
-                }
-                wl_shm::Format::Rgba8888 => [
-                    pixels[source + 3],
-                    pixels[source + 2],
-                    pixels[source + 1],
-                    pixels[source],
-                ],
-                wl_shm::Format::Rgbx8888 => [
-                    pixels[source + 3],
-                    pixels[source + 2],
-                    pixels[source + 1],
-                    255,
-                ],
-                wl_shm::Format::Bgra8888 => [
-                    pixels[source + 1],
-                    pixels[source + 2],
-                    pixels[source + 3],
-                    pixels[source],
-                ],
-                wl_shm::Format::Bgrx8888 => [
-                    pixels[source + 1],
-                    pixels[source + 2],
-                    pixels[source + 3],
-                    255,
-                ],
-                unsupported => {
-                    return Err(format!("unsupported wl_shm format: {unsupported:?}").into());
-                }
-            };
-
-            rgba[target..target + 4].copy_from_slice(&[r, g, b, a]);
-        }
-    }
-
-    Ok(rgba)
+    let screenshot = WaylandCapturer.capture()?;
+    show_zoom_window(screenshot, config.backend)
 }
 
 struct Viewer {
@@ -397,12 +163,11 @@ struct Viewer {
 }
 
 impl Viewer {
-    fn new(screenshot: Screenshot) -> Result<Self> {
+    fn new(screenshot: Screenshot, backend: RenderBackend) -> Result<Self> {
         let sdl = sdl2::init()?;
         let video = sdl.video()?;
         let gl_attr = video.gl_attr();
-        gl_attr.set_context_profile(GLProfile::Core);
-        gl_attr.set_context_version(3, 3);
+        backend.configure_gl(&gl_attr);
         gl_attr.set_double_buffer(true);
 
         let display = video.current_display_mode(0)?;
@@ -420,7 +185,7 @@ impl Viewer {
 
         gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
 
-        let gl = GlResources::new(&screenshot)?;
+        let gl = GlResources::new(&screenshot, backend)?;
         let mouse = sdl.mouse();
         let event_pump = sdl.event_pump()?;
         let (width, height) = window.drawable_size();
@@ -599,8 +364,8 @@ impl Drop for Viewer {
     }
 }
 
-fn show_zoom_window(screenshot: Screenshot) -> Result<()> {
-    let mut viewer = Viewer::new(screenshot)?;
+fn show_zoom_window(screenshot: Screenshot, backend: RenderBackend) -> Result<()> {
+    let mut viewer = Viewer::new(screenshot, backend)?;
     viewer.run()
 }
 
@@ -624,16 +389,18 @@ struct GlResources {
 }
 
 impl GlResources {
-    fn new(screenshot: &Screenshot) -> Result<Self> {
-        let program = create_program()?;
+    fn new(screenshot: &Screenshot, backend: RenderBackend) -> Result<Self> {
+        let program = create_program(backend)?;
         let mut vao = 0;
         let mut vbo = 0;
         let mut texture = 0;
 
         unsafe {
-            gl::GenVertexArrays(1, &mut vao);
+            if backend.uses_vertex_arrays() {
+                gl::GenVertexArrays(1, &mut vao);
+                gl::BindVertexArray(vao);
+            }
             gl::GenBuffers(1, &mut vbo);
-            gl::BindVertexArray(vao);
             gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
             gl::BufferData(
                 gl::ARRAY_BUFFER,
@@ -675,6 +442,8 @@ impl GlResources {
             );
         }
 
+        let image_texture_uniform =
+            unsafe { gl::GetUniformLocation(program, CString::new("image_texture")?.as_ptr()) };
         let viewport_uniform =
             unsafe { gl::GetUniformLocation(program, CString::new("viewport")?.as_ptr()) };
         let spotlight_center_uniform =
@@ -687,6 +456,11 @@ impl GlResources {
             unsafe { gl::GetUniformLocation(program, CString::new("spotlight_enabled")?.as_ptr()) };
         let fade_alpha_uniform =
             unsafe { gl::GetUniformLocation(program, CString::new("fade_alpha")?.as_ptr()) };
+
+        unsafe {
+            gl::UseProgram(program);
+            gl::Uniform1i(image_texture_uniform, 0);
+        }
 
         Ok(Self {
             program,
@@ -734,7 +508,9 @@ impl GlResources {
             gl::Uniform1f(self.fade_alpha_uniform, fade_alpha);
             gl::ActiveTexture(gl::TEXTURE0);
             gl::BindTexture(gl::TEXTURE_2D, self.texture);
-            gl::BindVertexArray(self.vao);
+            if self.vao != 0 {
+                gl::BindVertexArray(self.vao);
+            }
             gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
             gl::BufferSubData(
                 gl::ARRAY_BUFFER,
@@ -752,20 +528,25 @@ impl Drop for GlResources {
         unsafe {
             gl::DeleteTextures(1, &self.texture);
             gl::DeleteBuffers(1, &self.vbo);
-            gl::DeleteVertexArrays(1, &self.vao);
+            if self.vao != 0 {
+                gl::DeleteVertexArrays(1, &self.vao);
+            }
             gl::DeleteProgram(self.program);
         }
     }
 }
 
-fn create_program() -> Result<u32> {
-    let vertex_shader = compile_shader(gl::VERTEX_SHADER, GL33_VERTEX_SHADER)?;
-    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, GL33_FRAGMENT_SHADER)?;
+fn create_program(backend: RenderBackend) -> Result<u32> {
+    let (vertex_source, fragment_source) = backend.shaders();
+    let vertex_shader = compile_shader(gl::VERTEX_SHADER, vertex_source)?;
+    let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, fragment_source)?;
     let program = unsafe { gl::CreateProgram() };
 
     unsafe {
         gl::AttachShader(program, vertex_shader);
         gl::AttachShader(program, fragment_shader);
+        gl::BindAttribLocation(program, 0, CString::new("position")?.as_ptr());
+        gl::BindAttribLocation(program, 1, CString::new("tex_coord")?.as_ptr());
         gl::LinkProgram(program);
         gl::DeleteShader(vertex_shader);
         gl::DeleteShader(fragment_shader);
@@ -851,9 +632,3 @@ fn c_log_to_string(buffer: &[u8]) -> String {
         .map(|message| message.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
-
-delegate_registry!(CaptureState);
-delegate_output!(CaptureState);
-delegate_noop!(CaptureState: ignore wl_shm::WlShm);
-delegate_noop!(CaptureState: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(CaptureState: ignore wl_buffer::WlBuffer);
