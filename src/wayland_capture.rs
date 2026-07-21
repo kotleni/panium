@@ -281,12 +281,17 @@ fn convert_to_rgba(
     format: wl_shm::Format,
     y_inverted: bool,
 ) -> Result<Vec<u8>> {
+    let bpp: u32 = match format {
+        wl_shm::Format::Bgr888 | wl_shm::Format::Rgb888 => 3,
+        _ => 4,
+    };
+
     let mut rgba = vec![0; (width * height * 4) as usize];
 
     for y in 0..height {
         let source_y = if y_inverted { height - 1 - y } else { y };
         for x in 0..width {
-            let source = (source_y * stride + x * 4) as usize;
+            let source = (source_y * stride + x * bpp) as usize;
             let target = ((y * width + x) * 4) as usize;
 
             let [r, g, b, a] = match format {
@@ -330,6 +335,18 @@ fn convert_to_rgba(
                     pixels[source + 1],
                     pixels[source + 2],
                     pixels[source + 3],
+                    255,
+                ],
+                wl_shm::Format::Bgr888 => [
+                    pixels[source],
+                    pixels[source + 1],
+                    pixels[source + 2],
+                    255,
+                ],
+                wl_shm::Format::Rgb888 => [
+                    pixels[source + 2],
+                    pixels[source + 1],
+                    pixels[source],
                     255,
                 ],
                 unsupported => {
