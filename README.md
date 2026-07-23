@@ -1,4 +1,4 @@
-<img src="./logo.png" width=240 />
+<img src="./logo.png" width=120 />
 
 # Panium
 
