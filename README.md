@@ -12,8 +12,6 @@
   <em>Requires a compositor supporting <code>zwlr_screencopy_manager_v1</code>.</em>
 </p>
 
----
-
 ## Support
 | Name | Status |
 | -----|--------|
@@ -23,8 +21,6 @@
 | KDE | Broken (<a href="https://github.com/kotleni/panium/issues/2">#2</a>) |
 | Gnome | Broken (<a href="https://github.com/kotleni/panium/issues/2">#2</a>) |
 
----
-
 ## Controls
 
 | Key | Feature |
@@ -33,8 +29,6 @@
 | **Arrow buttons** or **hold left mouse button** | Move around |
 | **Q** or **Esc** | Close the app |
 | **F** | Toggle spotlight mode |
-
----
 
 ## Installing
 
