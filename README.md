@@ -14,6 +14,17 @@
 
 ---
 
+## Support
+| Name | Status |
+| -----|--------|
+| Hyprland | Works |
+| Sway | Works |
+| Niri | Works |
+| KDE | Broken (#2) |
+| Gnome | Broken (#2) |
+
+---
+
 ## Controls
 
 | Key | Feature |
