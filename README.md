@@ -1,3 +1,5 @@
+<img src="./logo.png" width=240 />
+
 # Panium
 
 **Panium** is a lightweight, oxidized zoom and pan utility for Wayland compositors.
@@ -13,4 +15,10 @@
 | F                  | Toggle spotlight mode                 |
 
 ### Installing
+**ArchLinux**:
+
+You can install it <a href="https://aur.archlinux.org/packages/panium-git">from AUR</a>, example: `yay -S panium-git`
+
+**Other distros**:
+
 You can just execute `./install` in project directory to install it systemwide.
