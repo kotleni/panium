@@ -1,24 +1,49 @@
-<img src="./logo.png" width=120 />
+<p align="center">
+  <img src="./logo.png" width="120" alt="Panium logo" />
+</p>
 
-# Panium
+<h1 align="center">Panium</h1>
 
-**Panium** is a lightweight, oxidized zoom and pan utility for Wayland compositors.
+<p align="center">
+  <strong>Panium</strong> is a lightweight, oxidized zoom and pan utility for Wayland compositors.
+</p>
 
-> **Note:** Requires a compositor supporting `zwlr_screencopy_manager_v1`.
+<p align="center">
+  <em>Requires a compositor supporting <code>zwlr_screencopy_manager_v1</code>.</em>
+</p>
 
-### Controls
+---
+
+## Controls
+
 | Key | Feature |
-| ------------------ | ------------------------------------- |
-| W/S or mouse wheel | Zoom/unzoom to mouse position         |
-| Arrow buttons or hold left mouse button | Move around      |
-| Q or Esc           | Close the app                         |
-| F                  | Toggle spotlight mode                 |
+|------|---------|
+| **W/S** or **mouse wheel** | Zoom/unzoom to mouse position |
+| **Arrow buttons** or **hold left mouse button** | Move around |
+| **Q** or **Esc** | Close the app |
+| **F** | Toggle spotlight mode |
 
-### Installing
-**ArchLinux**:
+---
 
-You can install it <a href="https://aur.archlinux.org/packages/panium-git">from AUR</a>, example: `yay -S panium-git`
+## Installing
 
-**Other distros**:
+### Arch Linux
 
-You can just execute `./install` in project directory to install it systemwide.
+Install it from the AUR:
+
+```sh
+$ yay -S panium-git
+```
+
+Or visit:
+https://aur.archlinux.org/packages/panium-git
+
+### Other distros
+
+Execute:
+
+```sh
+# ./install
+```
+
+from the project directory to install it systemwide.
