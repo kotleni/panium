@@ -20,8 +20,8 @@
 | Hyprland | Works |
 | Sway | Works |
 | Niri | Works |
-| KDE | Broken (#2) |
-| Gnome | Broken (#2) |
+| KDE | Broken (<a href="https://github.com/kotleni/panium/issues/2">#2</a>) |
+| Gnome | Broken (<a href="https://github.com/kotleni/panium/issues/2">#2</a>) |
 
 ---
 
